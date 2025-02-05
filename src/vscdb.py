@@ -17,8 +17,7 @@ class VSCDBQuery:
         logger.info(f"Database path: {os.path.join(os.path.basename(os.path.dirname(self.db_path)), os.path.basename(self.db_path))}")
 
     def query_to_json(self, query: str) -> list[Any] | dict[str, str]:
-        """
-        Execute a SQL query and return the results as a JSON-compatible list.
+        """Execute a SQL query and return the results.
 
         Args:
             query (str): The SQL query to execute.
@@ -34,8 +33,8 @@ class VSCDBQuery:
             rows = cursor.fetchall()
             conn.close()
 
-            # Assuming the query returns rows with a single column
-            result = [row[0] for row in rows]
+            # Return full rows instead of just first column
+            result = rows
             logger.success(f"Query executed successfully, fetched {len(result)} rows.")
             return result
         except sqlite3.Error as e:
@@ -52,19 +51,36 @@ class VSCDBQuery:
                 config = yaml.safe_load(config_file)
             query = config['aichat_query']
             logger.debug("Loaded AI chat query from config.yaml")
+            
+            # Get data from ItemTable
             results = self.query_to_json(query)
-
+            
+            # Also query cursorDiskKV table
+            try:
+                conn = sqlite3.connect(f'file:{self.db_path}?mode=ro', uri=True)
+                cursor = conn.cursor()
+                cursor.execute("SELECT key, value FROM cursorDiskKV")
+                kv_rows = cursor.fetchall()
+                conn.close()
+                
+                # Add cursorDiskKV results
+                results.extend(kv_rows)
+                
+            except sqlite3.Error as e:
+                logger.debug(f"Note: cursorDiskKV table not found or not accessible: {e}")
+            
             # Log the structure of each result
-            for i, result in enumerate(results):
+            for key, value in results:
                 try:
-                    data = json.loads(result)
-                    logger.debug(f"Data structure {i}:")
+                    data = json.loads(value)
+                    logger.debug(f"Processing key: {key}")
                     if isinstance(data, dict):
                         logger.debug(f"Keys: {list(data.keys())}")
-                        # Log a sample of the data structure
                         logger.debug(f"Sample: {json.dumps(data, indent=2)[:500]}...")
-                except json.JSONDecodeError as e:
-                    logger.error(f"Failed to parse result {i}: {e}")
+                except json.JSONDecodeError:
+                    continue
+                except Exception as e:
+                    logger.debug(f"Error processing {key}: {e}")
 
             return results
         except Exception as e:
@@ -92,12 +108,7 @@ class VSCDBQuery:
             return []
 
     def inspect_table(self, table_name: str, limit: int = 5) -> None:
-        """Inspect the contents of a table.
-        
-        Args:
-            table_name (str): Name of the table to inspect
-            limit (int): Number of rows to show
-        """
+        """Inspect the contents of a table."""
         try:
             conn = sqlite3.connect(f'file:{self.db_path}?mode=ro', uri=True)
             cursor = conn.cursor()
@@ -109,23 +120,34 @@ class VSCDBQuery:
             for col in columns:
                 logger.info(f"  - {col[1]} ({col[2]})")
 
-            # Get sample data
-            cursor.execute(f"SELECT * FROM {table_name} LIMIT {limit}")
-            rows = cursor.fetchall()
-            logger.info(f"\nSample data from {table_name} (first {limit} rows):")
-            for row in rows:
-                logger.info(f"  {row}")
-
-            # For ItemTable, which likely has key-value pairs, let's also look for chat-related keys
             if table_name == 'ItemTable':
+                # List all keys
+                cursor.execute("""
+                    SELECT [key]
+                    FROM ItemTable
+                    ORDER BY [key]
+                """)
+                keys = cursor.fetchall()
+                logger.info("\nAll keys in ItemTable:")
+                for key in keys:
+                    logger.info(f"  - {key[0]}")
+
+                # Look for potential chat-related content with broader search
                 cursor.execute("""
                     SELECT [key], substr(value, 1, 100) as preview 
                     FROM ItemTable 
-                    WHERE [key] LIKE '%chat%' OR [key] LIKE '%composer%'
+                    WHERE [key] LIKE '%chat%' 
+                       OR [key] LIKE '%composer%'
+                       OR [key] LIKE '%conversation%'
+                       OR [key] LIKE '%copilot%'
+                       OR [key] LIKE '%message%'
+                       OR [key] LIKE '%history%'
+                       OR [key] LIKE '%ai%'
+                       OR [key] LIKE '%assistant%'
                 """)
                 chat_rows = cursor.fetchall()
                 if chat_rows:
-                    logger.info("\nChat-related entries found:")
+                    logger.info("\nPotentially relevant entries found:")
                     for key, preview in chat_rows:
                         logger.info(f"  Key: {key}")
                         logger.info(f"  Preview: {preview}...")
@@ -134,6 +156,101 @@ class VSCDBQuery:
             conn.close()
         except Exception as e:
             logger.error(f"Error inspecting table {table_name}: {e}")
+
+    def find_db_files(self) -> list[str]:
+        """Find all potential database files in the workspace directory."""
+        db_dir = os.path.dirname(self.db_path)
+        db_files = []
+
+        for file in os.listdir(db_dir):
+            if file.endswith('.vscdb') or file.endswith('.db'):
+                full_path = os.path.join(db_dir, file)
+                logger.info(f"Found database file: {file}")
+                db_files.append(full_path)
+
+        return db_files
+
+    def inspect_key(self, key: str) -> None:
+        """Inspect the full contents of a specific key."""
+        try:
+            conn = sqlite3.connect(f'file:{self.db_path}?mode=ro', uri=True)
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM ItemTable WHERE [key] = ?", (key,))
+            row = cursor.fetchone()
+            conn.close()
+
+            if row:
+                try:
+                    data = json.loads(row[0])
+                    logger.info(f"\nFull contents of {key}:")
+                    if isinstance(data, dict):
+                        logger.info(f"Keys: {list(data.keys())}")
+                        for k, v in data.items():
+                            logger.info(f"\n{k}:")
+                            logger.info(f"{json.dumps(v, indent=2)[:1000]}...")
+                    elif isinstance(data, list):
+                        logger.info(f"List with {len(data)} items")
+                        for item in data[:5]:  # Show first 5 items
+                            logger.info(f"\nItem:")
+                            logger.info(f"{json.dumps(item, indent=2)[:1000]}...")
+                except json.JSONDecodeError:
+                    logger.info(f"Raw value: {row[0][:1000]}...")
+        except Exception as e:
+            logger.error(f"Error inspecting key {key}: {e}")
+
+    def inspect_composer(self, composer_id: str) -> None:
+        """Inspect all data related to a specific composer ID."""
+        try:
+            conn = sqlite3.connect(f'file:{self.db_path}?mode=ro', uri=True)
+            cursor = conn.cursor()
+            
+            # First get all generations to find their UUIDs
+            cursor.execute("SELECT value FROM ItemTable WHERE [key] = 'aiService.generations'")
+            row = cursor.fetchone()
+            generation_uuids = []
+            if row:
+                try:
+                    generations = json.loads(row[0])
+                    if isinstance(generations, list):
+                        for gen in generations:
+                            if isinstance(gen, dict) and 'generationUUID' in gen:
+                                generation_uuids.append(gen['generationUUID'])
+                                logger.debug(f"Found generation UUID: {gen['generationUUID']}")
+                except json.JSONDecodeError:
+                    pass
+
+            # Now search for responses in cursorDiskKV table
+            cursor.execute("SELECT key, value FROM cursorDiskKV")
+            responses = cursor.fetchall()
+            for key, value in responses:
+                try:
+                    data = json.loads(value)
+                    if isinstance(data, dict) and 'response' in data:
+                        logger.info(f"\nFound response in cursorDiskKV key {key}:")
+                        logger.info(json.dumps(data, indent=2))
+                except json.JSONDecodeError:
+                    continue
+
+            # Also get the prompts
+            cursor.execute("SELECT value FROM ItemTable WHERE [key] = 'aiService.prompts'")
+            row = cursor.fetchone()
+            if row:
+                try:
+                    prompts = json.loads(row[0])
+                    if isinstance(prompts, list):
+                        logger.info("\nPrompts:")
+                        for prompt in prompts:
+                            if isinstance(prompt, dict):
+                                if 'text' in prompt:
+                                    logger.info(f"- Text: {prompt['text']}")
+                                if 'generationUUID' in prompt:
+                                    logger.info(f"  UUID: {prompt['generationUUID']}")
+                except json.JSONDecodeError:
+                    pass
+
+            conn.close()
+        except Exception as e:
+            logger.error(f"Error inspecting composer {composer_id}: {e}")
 
 # Example usage:
 # db_query = VSCDBQuery('/Users/somogyijanos/Library/Application Support/Cursor/User/workspaceStorage/b989572f2e2186b48b808da2da437416/state.vscdb')

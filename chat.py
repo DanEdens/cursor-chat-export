@@ -199,5 +199,29 @@ def discover(
         logger.error(error_message)
         raise typer.Exit(code=1)
 
+@app.command()
+def inspect(
+    db_path: str = typer.Argument(None, help="The path to the SQLite database file"),
+    key: str = typer.Option(None, help="Specific key to inspect"),
+    composer_id: str = typer.Option(None, help="Specific composer ID to inspect")
+):
+    """Inspect specific keys or composer ID in the database"""
+    if not db_path:
+        db_path = get_latest_workspace_db_path()
+    
+    db_query = VSCDBQuery(db_path)
+    if composer_id:
+        db_query.inspect_composer(composer_id)
+    elif key:
+        db_query.inspect_key(key)
+    else:
+        composer_keys = [
+            'composer.composerData',
+            'aiService.generations',
+            'aiService.prompts'
+        ]
+        for k in composer_keys:
+            db_query.inspect_key(k)
+
 if __name__ == "__main__":
     app()

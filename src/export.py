@@ -61,11 +61,69 @@ class MarkdownChatFormatter(ChatFormatter):
 
         return user_text_text
 
-    def format(self, chat_data: list[str], image_dir: str | None = 'images', tab_ids: list[int] | None = None) -> dict[int, str] | None:
+    def _format_composer_data(self, composer_data: dict, generations: list, prompts: list, responses: list) -> str:
+        """Format composer data including related generations and prompts."""
+        formatted = []
+        
+        # Add composer metadata
+        formatted.append(f"# {composer_data.get('name', 'Untitled Composer')}\n")
+        formatted.append(f"Composer ID: {composer_data.get('composerId')}\n")
+        formatted.append(f"Created: {composer_data.get('createdAt')}\n")
+        formatted.append(f"Last Updated: {composer_data.get('lastUpdatedAt')}\n")
+        formatted.append(f"Mode: {composer_data.get('unifiedMode', 'unknown')}\n\n")
+        
+        # Create a map of generation UUIDs to responses
+        response_map = {}
+        for key, value in responses:
+            try:
+                data = json.loads(value)
+                if isinstance(data, dict) and 'response' in data:
+                    # Try to extract UUID from key or look in data
+                    uuid = data.get('generationUUID', key.split(':')[-1])
+                    response_map[uuid] = data['response']
+                    logger.debug(f"Found response for UUID {uuid}")
+            except json.JSONDecodeError:
+                continue
+        
+        # Add conversation history
+        formatted.append("## Conversation\n")
+        
+        # Sort prompts by timestamp if available
+        if prompts and isinstance(prompts[0], dict) and 'unixMs' in prompts[0]:
+            prompts = sorted(prompts, key=lambda x: x.get('unixMs', 0))
+        
+        for prompt in prompts:
+            if not isinstance(prompt, dict):
+                continue
+            
+            # Add user message
+            if 'text' in prompt:
+                formatted.append("### User\n")
+                formatted.append(f"{prompt['text']}\n\n")
+            
+            # Look for corresponding AI response
+            if 'generationUUID' in prompt:
+                uuid = prompt['generationUUID']
+                logger.debug(f"Looking for response with UUID {uuid}")
+                if uuid in response_map:
+                    formatted.append("### Assistant\n")
+                    formatted.append(f"{response_map[uuid]}\n\n")
+                else:
+                    # Look in generations for textDescription
+                    for gen in generations:
+                        if isinstance(gen, dict) and gen.get('generationUUID') == uuid:
+                            if 'textDescription' in gen:
+                                formatted.append("### Assistant\n")
+                                formatted.append(f"{gen['textDescription']}\n\n")
+                            break
+        
+        return "\n".join(formatted)
+
+    def format(self, chat_data: list[tuple[str, str]], image_dir: str | None = 'images', tab_ids: list[int] | None = None) -> dict[int, str] | None:
         """Format the chat data into Markdown format.
 
         Args:
-            chat_data (list[str]): List of JSON strings containing chat data.
+            chat_data (list[tuple[str, str]]): List of (key, value) tuples containing chat data.
             image_dir (str): The directory where images will be saved.
             tab_ids (list[int]): List of tab indices to include exclusively.
 
@@ -76,26 +134,54 @@ class MarkdownChatFormatter(ChatFormatter):
             formatted_chats = {}
             chat_count = 0
 
-            for data_str in chat_data:
-                data = json.loads(data_str)
+            # First, collect all the data
+            composer_data = None
+            generations = []
+            prompts = []
+            responses = []
 
-                # Handle aichat data
-                if 'tabs' in data:
-                    for tab_index, tab in enumerate(data['tabs']):
-                        if tab_ids is not None and tab_index not in tab_ids:
-                            continue
-                        formatted_chat = self._format_aichat_tab(tab, chat_count + 1, image_dir)
-                        if formatted_chat.strip():  # Only include non-empty chats
-                            chat_count += 1
-                            formatted_chats[f"chat_{chat_count}"] = formatted_chat
+            for key, value in chat_data:
+                try:
+                    data = json.loads(value)
+                    if not isinstance(data, (dict, list)):  # Skip if not dict or list
+                        continue
 
-                # Handle composer data
-                elif 'allComposers' in data:
-                    for composer in data['allComposers']:
-                        formatted_chat = self._format_composer_chat(composer, chat_count + 1)
-                        if formatted_chat.strip():  # Only include non-empty chats
-                            chat_count += 1
-                            formatted_chats[f"chat_{chat_count}"] = formatted_chat
+                    if key == 'composer.composerData':
+                        composer_data = data
+                    elif key == 'aiService.generations':
+                        generations = data if isinstance(data, list) else []
+                    elif key == 'aiService.prompts':
+                        prompts = data if isinstance(data, list) else []
+                    elif key.startswith('cursorDiskKV:'):
+                        responses.append((key, value))
+                except json.JSONDecodeError:
+                    continue
+
+            # Handle composer data if available
+            if composer_data and isinstance(composer_data, dict) and 'allComposers' in composer_data:
+                for composer in composer_data['allComposers']:
+                    chat_count += 1
+                    formatted_chat = self._format_composer_data(composer, generations, prompts, responses)
+                    if formatted_chat.strip():
+                        formatted_chats[f"composer_{composer.get('composerId', chat_count)}"] = formatted_chat
+
+            # Handle regular chat data
+            for key, value in chat_data:
+                try:
+                    data = json.loads(value)
+                    if not isinstance(data, dict):  # Skip if not a dict
+                        continue
+
+                    if 'tabs' in data:
+                        for tab_index, tab in enumerate(data['tabs']):
+                            if tab_ids is not None and tab_index not in tab_ids:
+                                continue
+                            formatted_chat = self._format_aichat_tab(tab, chat_count + 1, image_dir)
+                            if formatted_chat.strip():
+                                chat_count += 1
+                                formatted_chats[f"chat_{chat_count}"] = formatted_chat
+                except json.JSONDecodeError:
+                    continue
 
             if formatted_chats:
                 logger.success(f"Successfully formatted {len(formatted_chats)} chats.")
@@ -194,6 +280,22 @@ class MarkdownChatFormatter(ChatFormatter):
         raw_text = re.sub(r'```python:[^\n]+', '```python', bubble['rawText'])
         return [f"## AI ({model_type}):\n\n{raw_text}\n"]
 
+    def _format_history_entries(self, entries: list, index: int) -> str:
+        """Format history entries into chat format."""
+        formatted_chat = [f"# History Entries - {index}\n"]
+
+        for entry in entries:
+            if isinstance(entry, list) and len(entry) >= 2:
+                # Handle Git history format
+                if entry[0] == "Git":
+                    formatted_chat.append(f"## Git Entry:\n\n```\n{json.dumps(entry[1], indent=2)}\n```\n")
+            elif isinstance(entry, dict):
+                # Handle other history entries
+                if 'editor' in entry:
+                    formatted_chat.append(f"## Editor Entry:\n\n```\n{json.dumps(entry['editor'], indent=2)}\n```\n")
+
+        return "\n".join(formatted_chat) if len(formatted_chat) > 1 else ""
+
 class FileSaver(ABC):
     @abstractmethod
     def save(self, formatted_data: str, file_path: str) -> None:
@@ -233,11 +335,11 @@ class ChatExporter:
         self.formatter = formatter
         self.saver = saver
 
-    def export(self, chat_data: list[str], output_dir: str, image_dir: str, tab_ids: list[int] | None = None) -> None:
+    def export(self, chat_data: list[tuple[str, str]], output_dir: str, image_dir: str, tab_ids: list[int] | None = None) -> None:
         """Export the chat data by formatting and saving it.
 
         Args:
-            chat_data (list[str]): List of JSON strings containing chat data.
+            chat_data (list[tuple[str, str]]): List of (key, value) tuples containing chat data.
             output_dir (str): The directory where the formatted data will be saved.
             image_dir (str): The directory where images will be saved.
             tab_ids (list[int]): List of tab indices to include exclusively.

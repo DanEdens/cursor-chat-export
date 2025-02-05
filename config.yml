@@ -3,12 +3,29 @@ default_vscdb_dir_paths:
   Darwin: "~/Library/Application Support/Cursor/User/workspaceStorage"
   Linux: "~/.config/Cursor/User/workspaceStorage"
 aichat_query: |
-  SELECT value
+  SELECT [key], value
   FROM ItemTable 
   WHERE [key] IN (
     'workbench.panel.aichat.view.aichat.chatdata',
-    'composer.composerData'
+    'composer.composerData',
+    'workbench.panel.chat.view.chat.chatData',
+    'workbench.panel.chatSidebar.state',
+    'GitHub.copilot-chat.history',
+    'workbench.panel.chatSidebar.view.chat.chatData',
+    'workbench.panel.chat.view.copilot.chatData',
+    'workbench.panel.composerViewPane2.view.chatData',
+    'workbench.panel.composerChatViewPane.chatData',
+    'aiService.generations',
+    'aiService.prompts',
+    'cursorDiskKV'
   )
+  OR [key] LIKE '%composer%'
+  OR [key] LIKE '%conversation%'
+  OR [key] LIKE '%history%'
+  OR [key] LIKE '%generation%'
+  OR [key] LIKE '%response%'
+  OR [key] LIKE '%cursorDiskKV%'
+  OR ([key] LIKE '%chat%' AND [key] LIKE '%data%')
 table_list_query: |
   SELECT 
     name
